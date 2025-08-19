@@ -1,0 +1,555 @@
+---
+title: "WGAN_R"
+author: "VS"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(lixoftConnectors) 
+lixoft_path <- "C:/Programme/Lixoft/MonolixSuite2024R1/"
+
+initializeLixoftConnectors(software = "simulx", path = lixoft_path)
+
+library(tidyverse)
+library(dplyr)
+library(magrittr)
+library(purrr)
+library(RsSimulx)
+# library(flux) #auc calculation
+library(kernlab)
+
+```
+
+# Covariate modelling
+
+## 20 patients - original
+
+```{r}
+
+set.seed(1245)
+
+sex <- sample(c(rep("f", 10), rep("m",10)))
+
+df_demo <-  data.frame(id = 1:20,
+                       sex)
+
+df_demo %<>% 
+  mutate(WT = round(if_else(sex=="m", rnorm(20, 85, 10), rnorm(20, 64, 10)),0), 
+         HT = round(if_else(sex=="m", rnorm(20, 179, 7), rnorm(20, 164, 7)),0),
+         AGE = round(runif(20, 18, 60)))
+
+ggplot(df_demo)+
+  geom_density(aes(HT, group=sex, colour=sex))
+
+```
+
+## Inline model
+
+```{r}
+
+cmt1_oa.model2<- inlineModel("
+
+[LONGITUDINAL]
+input = {ka, V, Cl, add, prop}
+
+EQUATION:
+
+; PK model definition
+Cc = pkmodel(ka, V, Cl)
+
+DEFINITION:
+y = {distribution=normal, prediction=Cc, errorModel=combined1(add, prop)}
+
+
+OUTPUT:
+output = {Cc, y}
+
+[INDIVIDUAL]
+input = {ka_pop, ka_sd,
+         V_pop, V_sd, 
+         CL_pop, CL_sd, 
+         logWT}
+
+DEFINITION:
+Cl = {distribution=lognormal, typical=CL_pop, sd=CL_sd}
+V  = {distribution=lognormal, typical=V_pop, covariate=logWT, coefficient=0.75, sd=V_sd}
+ka = {distribution=lognormal, typical=ka_pop, sd=ka_sd}
+
+[COVARIATE]
+
+input = {WT}
+
+EQUATION:
+logWT = log(WT) - log(70)
+
+")
+```
+
+## Curve simulation
+```{r}
+set.seed(42)
+study_h <- 24 
+study_n <- 20
+study_tp <- c(0.5, 1, 1.5, 2, 4, 6, 8, 12)
+
+adm <- data.frame( id=1:study_n,
+                   amount = 300,
+                   time = 0)
+
+cmt1_oa.model2.params <- data.frame( 
+  ka_pop = 0.5, ka_sd=0.2,
+  V_pop = 14, V_sd=0.3,
+  CL_pop = 5, CL_sd=0.2,
+  prop = 0.1, add = 0.2
+  )
+
+df <- simulx( model = cmt1_oa.model2,
+              parameter = cmt1_oa.model2.params,
+              treatment = adm,
+              covariate = df_demo,
+              settings = list(seed=1234),
+              output = list( list(name='Cc', time=study_tp),
+                             list(name='y', time=study_tp))) 
+
+df2 <- df$y %>% 
+  left_join(.,
+            df_demo %>% mutate(id=as.factor(id)),
+            by="id")
+
+
+ggplot(df2, aes(time, y, group=id, colour=as.factor(sex)) ) +
+  geom_line(alpha=0.3) +
+  labs( title="1 CMT, oral abs." )+
+  facet_wrap(.~sex)
+
+ggplot(df2, aes(time, y, group=id) ) +
+  geom_line(alpha=0.3) +
+  labs( title="1 CMT, oral abs." )
+
+```
+
+#Export to Monolix
+```{r}
+dosing <- data.frame(id=1:20, time=0, AMT=300, MDV=1, CENS=".")
+
+df_export <- bind_rows(df2 %>% 
+                         mutate(CENS = ifelse(y<0.5, "1", "0"), 
+                                MDV=0,
+                                DV=y,
+                                id = as.numeric(id)) %>% 
+                         select(-y),
+                       dosing) %>% 
+  arrange(id, time) %>% 
+  group_by(id) %>% 
+  fill(3:6, .direction="up") %>%
+  ungroup()
+
+# write.csv(df_export,"export_to_monolix_original.csv", na=".", row.names = FALSE)
+
+```
+
+
+##Conversions for WGAN
+```{r}
+
+new_min = -1
+new_max = 1
+
+df_conversion <- data.frame(Cc = c(min(df2$y), max(df2$y)),
+                            Age = c(min(df2$AGE), max(df2$AGE)),
+                            WT = c(min(df2$WT), max(df2$WT)),
+                            HT = c(min(df2$HT), max(df2$HT))
+                            ) 
+
+df_export <- df2 %>% 
+  select(id, time, Cc=y) %>% 
+  mutate(Cc = new_min + (Cc-min(Cc))*(new_max-new_min)/(max(Cc)-min(Cc))) %>%
+  pivot_wider(id_cols=id, names_from=time, values_from=Cc) %>% 
+  left_join(.,
+            df_demo%>% mutate(id=as.factor(id),
+                              across(c(WT, HT, AGE), ~new_min +
+                                     (.x-min(.x))*(new_max-new_min)/(max(.x)-min(.x)))),
+            by="id") 
+
+# write.csv(df_export, "2025-07_orig_pat_to_wgan.csv")
+# write.csv(df_conversion, "2025-07_conversion.csv")
+
+```
+
+# Import Data from WGAN
+##20 + 20
+```{r}
+
+new_min = -1
+new_max = 1
+
+df_conversion <- read.csv("2025-07_conversion.csv")
+
+df.admin <- data.frame(id = 1:20, MDV=1, AMT=300, TIME=0.0, CENS="0")
+
+df.julia <- read.csv("2025-07_fake_patients_20.csv", na=".")
+
+df.julia %<>%
+  mutate(id = row_number()) %>% 
+  pivot_longer(., cols = starts_with("X"), names_to="TIME", values_to="CONC") %>% 
+  mutate(TIME = as.numeric(str_replace(TIME, "X", ""))) %>% 
+  mutate(CONC = (CONC-new_min)*(df_conversion$Cc[2]-df_conversion$Cc[1])/(new_max-new_min)+df_conversion$Cc[1],
+         AGE = (AGE-new_min)*(df_conversion$Age[2]-df_conversion$Age[1])/(new_max-new_min)+df_conversion$Age[1],
+         WT = (WT-new_min)*(df_conversion$WT[2]-df_conversion$WT[1])/(new_max-new_min)+df_conversion$WT[1],
+         HT = (HT-new_min)*(df_conversion$HT[2]-df_conversion$HT[1])/(new_max-new_min)+df_conversion$HT[1],
+         CONC = round(CONC, 3),
+         across(c(AGE, WT, HT), ~round(.)),
+         MDV = 0,
+         CENS= ifelse(CONC<0.5, "1", "0")
+  ) %>% 
+  bind_rows(.,
+            df.admin) %>% 
+  arrange(id, TIME) %>% 
+  select(id, time=TIME, sex, WT, HT, AGE, CENS, MDV, DV=CONC, AMT) %>% 
+  group_by(id) %>% 
+  fill(c(sex, AGE, WT, HT)) %>% 
+  ungroup()
+
+
+df.original <- read.csv("export_to_monolix_original.csv", na=".")
+
+```
+
+
+```{r}
+
+df.julia.comb <- rbind(df.julia %>% 
+                         mutate(id = id+20), 
+                       df.original)
+
+# write.csv(df.julia, "export_to_monolix_julia_20.csv", na=".", row.names = FALSE)
+# 
+# write.csv(df.julia.comb, "export_to_monolix_comb_20.csv", na=".", row.names = FALSE)
+
+
+```
+
+##20 + 10
+```{r}
+
+n_julia = 10
+
+new_min = -1
+new_max = 1
+
+df_conversion <- read.csv("2025-07_conversion.csv")
+
+df.admin <- data.frame(id = 1:n_julia, MDV=1, AMT=300, TIME=0.0, CENS=0)
+
+df.julia <- read.csv("2025-07_fake_patients_10.csv", na=".")
+
+df.julia %<>%
+  mutate(id = row_number()) %>% 
+  pivot_longer(., cols = starts_with("X"), names_to="TIME", values_to="CONC") %>% 
+  mutate(TIME = as.numeric(str_replace(TIME, "X", ""))) %>% 
+  mutate(CONC = (CONC-new_min)*(df_conversion$Cc[2]-df_conversion$Cc[1])/(new_max-new_min)+df_conversion$Cc[1],
+         AGE = (AGE-new_min)*(df_conversion$Age[2]-df_conversion$Age[1])/(new_max-new_min)+df_conversion$Age[1],
+         WT = (WT-new_min)*(df_conversion$WT[2]-df_conversion$WT[1])/(new_max-new_min)+df_conversion$WT[1],
+         HT = (HT-new_min)*(df_conversion$HT[2]-df_conversion$HT[1])/(new_max-new_min)+df_conversion$HT[1],
+         CONC = round(CONC, 3),
+         across(c(AGE, WT, HT), ~round(.)),
+         MDV=0,
+         CENS=ifelse(CONC<0.5, 1, 0)
+  ) %>% 
+  bind_rows(.,
+            df.admin) %>% 
+  arrange(id, TIME) %>% 
+  select(id, time=TIME, sex, WT, HT, AGE, CENS, MDV, DV=CONC, AMT) %>% 
+  group_by(id) %>% 
+  fill(c(sex, AGE, WT, HT)) %>% 
+  ungroup()
+
+
+df.original <- read.csv("export_to_monolix_original.csv", na=".")
+
+```
+
+
+```{r}
+
+df.julia.comb <- rbind(df.julia %>% 
+                         mutate(id = id+20), 
+                       df.original)
+
+# write.csv(df.julia.comb, "export_to_monolix_comb_10.csv", na=".", row.names = FALSE)
+
+```
+
+
+##20 + 40
+```{r}
+
+n_julia = 40
+
+new_min = -1
+new_max = 1
+
+df_conversion <- read.csv("2025-07_conversion.csv")
+
+df.admin <- data.frame(id = 1:n_julia, MDV=1, AMT=300, TIME=0.0, CENS=0)
+
+
+df.julia <- read.csv("2025-07_fake_patients_40.csv", na=".")
+
+df.julia %<>%
+  mutate(id = row_number()) %>% 
+  pivot_longer(., cols = starts_with("X"), names_to="TIME", values_to="CONC") %>% 
+  mutate(TIME = as.numeric(str_replace(TIME, "X", ""))) %>% 
+  mutate(CONC = (CONC-new_min)*(df_conversion$Cc[2]-df_conversion$Cc[1])/(new_max-new_min)+df_conversion$Cc[1],
+         AGE = (AGE-new_min)*(df_conversion$Age[2]-df_conversion$Age[1])/(new_max-new_min)+df_conversion$Age[1],
+         WT = (WT-new_min)*(df_conversion$WT[2]-df_conversion$WT[1])/(new_max-new_min)+df_conversion$WT[1],
+         HT = (HT-new_min)*(df_conversion$HT[2]-df_conversion$HT[1])/(new_max-new_min)+df_conversion$HT[1],
+         CONC = round(CONC, 3),
+         across(c(AGE, WT, HT), ~round(.)),
+         MDV = 0,
+         CENS=ifelse(CONC<0.5, 1, 0)
+  ) %>% 
+  bind_rows(.,
+            df.admin) %>% 
+  arrange(id, TIME) %>% 
+  select(id, time=TIME, sex, WT, HT, AGE, CENS, MDV, DV=CONC, AMT) %>% 
+  group_by(id) %>% 
+  fill(c(sex, AGE, WT, HT)) %>% 
+  ungroup()
+
+
+df.original <- read.csv("export_to_monolix_original.csv", na=".")
+
+```
+
+
+```{r}
+
+df.julia.comb <- rbind(df.julia %>% 
+                         mutate(id = id+20), 
+                       df.original)
+
+# write.csv(df.julia.comb, "export_to_monolix_comb_40.csv", na=".", row.names = FALSE)
+
+
+```
+
+##60
+```{r}
+
+n_julia = 60
+
+new_min = -1
+new_max = 1
+
+df_conversion <- read.csv("2025-07_conversion.csv")
+
+df.admin <- data.frame(id = 1:n_julia, MDV=1, AMT=300, TIME=0.0, CENS=0)
+
+# df.julia<- read.xlsx("../PopPK/2024/2024-07-03_fake_patients_jl.xlsx",1 )
+
+df.julia <- read.csv("2025-07_fake_patients_60.csv", na=".")
+
+df.julia %<>%
+  mutate(id = row_number()) %>% 
+  pivot_longer(., cols = starts_with("X"), names_to="TIME", values_to="CONC") %>% 
+  mutate(TIME = as.numeric(str_replace(TIME, "X", ""))) %>% 
+  mutate(CONC = (CONC-new_min)*(df_conversion$Cc[2]-df_conversion$Cc[1])/(new_max-new_min)+df_conversion$Cc[1],
+         AGE = (AGE-new_min)*(df_conversion$Age[2]-df_conversion$Age[1])/(new_max-new_min)+df_conversion$Age[1],
+         WT = (WT-new_min)*(df_conversion$WT[2]-df_conversion$WT[1])/(new_max-new_min)+df_conversion$WT[1],
+         HT = (HT-new_min)*(df_conversion$HT[2]-df_conversion$HT[1])/(new_max-new_min)+df_conversion$HT[1],
+         CONC = round(CONC, 3),
+         across(c(AGE, WT, HT), ~round(.)),
+         MDV = 0,
+         CENS=ifelse(CONC<0.5, 1, 0)
+  ) %>% 
+  bind_rows(.,
+            df.admin) %>% 
+  arrange(id, TIME) %>% 
+  select(id, time=TIME, sex, WT, HT, AGE, CENS, MDV, DV=CONC, AMT) %>% 
+  group_by(id) %>% 
+  fill(c(sex, AGE, WT, HT)) %>% 
+  ungroup()
+
+
+df.original <- read.csv("export_to_monolix_original.csv", na=".")
+
+```
+
+
+```{r}
+
+# write.csv(df.julia, "export_to_monolix_60.csv", na=".", row.names = FALSE)
+
+```
+
+
+
+#Statistical evaluation
+```{r}
+df.original <- read.csv("export_to_monolix_original.csv", na=".")
+df.julia <- read.csv("export_to_monolix_julia_20.csv", na=".")
+```
+
+```{r}
+a <- df.original %>% 
+  pivot_wider(id_cols=id, names_from=time, values_from=DV) %>% 
+  left_join(.,
+            df.original %>% 
+              group_by(id) %>% 
+              slice(1) %>% 
+              select(id,  WT, HT, AGE),
+            by="id") %>% 
+  select(-"0", -id)%>% 
+  as.matrix() #%>% 
+
+b <- df.julia %>% 
+  pivot_wider(id_cols=id, names_from=time, values_from=DV) %>% 
+  left_join(.,
+            df.julia %>% 
+              group_by(id) %>% 
+              slice(2) %>% 
+              select(id, WT, HT, AGE),
+            by="id") %>% 
+  select(-"0", -id) %>% 
+  as.matrix()
+
+```
+
+## Maximum Mean Discrepancy (MMD)
+```{r}
+
+set.seed(123)
+
+all_data <- rbind(a, b)
+
+k <- rbfdot(sigma = 1)
+
+K <- kernelMatrix(k, all_data)
+
+n <- nrow(a)
+m <- nrow(b)
+
+Kxx <- K[1:n, 1:n]               
+Kyy <- K[(n+1):(n+m), (n+1):(n+m)]  
+Kxy <- K[1:n, (n+1):(n+m)]    
+
+mmd2_stat <- mean(Kxx) + mean(Kyy) - 2 * mean(Kxy)
+cat("MMD^2 statistic:", mmd2_stat, "\n")
+
+```
+
+```{r}
+num_perm <- 1000
+mmd_perm_stats <- numeric(num_perm)
+
+for (i in 1:num_perm) {
+  perm_idx <- sample(1:(n + m))
+  group1_idx <- perm_idx[1:n]
+  group2_idx <- perm_idx[(n+1):(n+m)]
+  
+  Kxx_perm <- K[group1_idx, group1_idx]
+  Kyy_perm <- K[group2_idx, group2_idx]
+  Kxy_perm <- K[group1_idx, group2_idx]
+  
+  mmd_perm_stats[i] <- mean(Kxx_perm) + mean(Kyy_perm) - 2 * mean(Kxy_perm)
+}
+
+pval <- mean(mmd_perm_stats >= mmd2_stat)
+cat("Permutation test p-value:", pval, "\n")
+
+```
+
+## sensitivty testing with different sigmas
+```{r}
+
+p_results = c()
+mmd2_results = c()
+
+j=1
+
+for (sigma in c(0.01, 0.1, 0.5, 1, 2, 5, 10)) {
+  k <- rbfdot(sigma = sigma)
+  K <- kernelMatrix(k, rbind(a, b))
+  n <- nrow(a)
+  m <- nrow(b)
+  
+  Kxx <- K[1:n, 1:n]              
+  Kyy <- K[(n+1):(n+m), (n+1):(n+m)]  
+  Kxy <- K[1:n, (n+1):(n+m)]    
+  
+  mmd2_stat <- mean(Kxx) + mean(Kyy) - 2 * mean(Kxy)
+  
+  for (i in 1:num_perm) {
+    perm_idx <- sample(1:(n + m))
+    group1_idx <- perm_idx[1:n]
+    group2_idx <- perm_idx[(n+1):(n+m)]
+    
+    Kxx_perm <- K[group1_idx, group1_idx]
+    Kyy_perm <- K[group2_idx, group2_idx]
+    Kxy_perm <- K[group1_idx, group2_idx]
+    
+    mmd_perm_stats[i] <- mean(Kxx_perm) + mean(Kyy_perm) - 2 * mean(Kxy_perm)
+  }
+
+  pval <- mean(mmd_perm_stats >= mmd2_stat)
+  
+  p_results[j] = pval
+  mmd2_results[j] = mmd2_stat
+  
+  j=j+1
+  
+}
+
+print(p_results)
+print(mmd2_results)
+```
+
+## plots
+```{r}
+df.original <- read.csv("export_to_monolix_original.csv", na=".")
+df.julia <- read.csv("export_to_monolix_julia_20.csv", na=".")
+```
+
+```{r}
+df.o <- df.original %>% 
+  filter(!is.na(DV)) %>% 
+  mutate(source = "Original")
+
+df.j <- df.julia %>% 
+  mutate(source = "Artificial")
+
+df.all <- rbind(df.o, df.j)
+
+
+neworder <- c("Original","Artificial")
+
+
+ggplot(df.all %>% 
+         mutate(source=factor(source,levels=neworder) ),
+       aes(time, DV, group = id)) +
+  geom_line(aes(colour = source), alpha = 0.8) +
+  labs(
+    x = "Time [h]",
+    y = "Concentration [mg/L]"
+  ) +
+  facet_wrap(. ~ source, ncol = 2) +
+  theme_minimal() +
+  scale_color_manual(values = c("Original" = "dodgerblue3", "Artificial" = "violetred3")) +
+  guides(colour = "none") +
+  theme(
+    strip.text = element_text(size = 12)
+  )+
+  scale_x_continuous(breaks=c(0, 1, 2, 4, 6, 8, 12 ))
+
+
+# ggsave("C:/Synology/RobotSchool/Projects/2023 - WGAN PK/2025/Plots/curve_comparison.png", 
+#        height=10, width = 17, units=c("cm"))
+
+```
+
+
+
